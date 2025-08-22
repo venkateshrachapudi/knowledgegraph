@@ -1,0 +1,346 @@
+Given a user question, produce a typed parse that the orchestrator can trust:
+
+{
+  "text": "Does R-FLD restore flood coverage on P123 and what's the deductible?",
+  "anchors": {
+    "policies": ["P123"],
+    "claims": [],
+    "riders": ["R-FLD"],              // optional if you model rider IDs
+    "regulations": [],
+    "sections": [{"type":"clause","value":"4.2"}],
+    "jurisdictions": ["CA"]
+  },
+  "intents": {
+    "coverage": true,
+    "rider": true,
+    "exclusion": false,
+    "claim": false,
+    "regulation": false,
+    "compare": false
+  },
+  "risk_terms": ["flood"],
+  "time": {
+    "loss_date": null,
+    "policy_effective_window_requested": false
+  },
+  "constraints": {
+    "deductible_amount_requested": true,
+    "limits_requested": false,
+    "differences_requested": false
+  },
+  "numbers": {
+    "currency": [{"value":5000,"unit":"USD","span":[...]}]
+  },
+  "negations": [],
+  "qualifiers": ["after adding rider", "unless excluded"],
+  "confidence": 0.94,
+  "notes": ["parsed with regex+dictionaries (fast path)"]
+}
+
+
+that’s the schema the downstream query planner uses to pick graph templates and vector filters.
+
+the NLQ pipeline (fast path first, smart path second)
+           text
+            │
+     ┌──────▼───────────────────────────────────┐
+     │ 1) normalize & tokenize                  │
+     └──────┬───────────────────────────────────┘
+            │
+     ┌──────▼───────────┐   ┌───────────────────▼─────────┐
+     │ 2) anchors via   │   │ 3) intent + slots via       │
+     │    rules/regex   │   │    dictionaries + patterns  │
+     └──────┬───────────┘   └───────────┬─────────────────┘
+            │                           │
+     ┌──────▼─────────┐           ┌─────▼──────────┐
+     │ 4) quant/IDs   │           │ 5) semantics   │
+     │    (money, IDs)│           │    (negation,  │
+     └──────┬─────────┘           │    qualifiers) │
+            │                     └─────┬──────────┘
+            │                           │
+     ┌──────▼───────────────────────────▼───────┐
+     │ 6) link & validate (against KG indices)  │
+     └──────┬───────────────────────────────────┘
+            │
+     ┌──────▼───────────────────────────────────┐
+     │ 7) (optional) LLM parse for edge cases   │
+     │    with JSON schema guarded output       │
+     └──────────────────────────────────────────┘
+
+
+philosophy: be deterministic and cheap first (regex, tries, Aho-Corasick), then fall back to an LLM parser for weird or long questions (but still enforce a schema).
+
+1) normalize & tokenize
+
+lowercase, NFKC unicode normalize, collapse whitespace
+
+standardize punctuation (§ → “section”, unicode quotes → ASCII)
+
+split on words & symbols; keep spans (start,end) for later highlighting
+
+"What's the deductible on P123 after adding R-FLD?"
+→ tokens: ["what", "is", "the", "deductible", "on", "p123", "after", "adding", "r-fld"]
+
+2) anchors via rules/regex
+
+policy IDs: \bP\d{2,}\b
+
+claim IDs: \bCLM-\d+\b
+
+rider codes (if you have them): list/regex like \bR-[A-Z0-9]+\b
+
+reg citations: §\s*\d+(\.\d+)* or \bCCR-Title\d+\b, \bNYCRR-Insurance\b
+
+sections: clause\s+\d+(\.\d+)?, section\s+\d+, page\s+\d+
+
+Pre-compile regex for speed. Keep spans. Immediately validate candidate IDs against KG indices (e.g., Policy.policy_number) for precision.
+
+3) intent + slot detection (keyword dictionaries)
+
+multi-label intents:
+
+coverage: cover, coverage, covered, limit, deductible
+
+exclusion: exclude, exclusion, excluded
+
+rider: rider, endorsement, add-on
+
+claim: claim, losses, filed, paid
+
+regulation: regulation, law, statute, compliance
+
+compare: compare, difference, vs, versus, changes
+
+risk terms: flood, earthquake, wind, fire, war, theft, water, sewer backup…
+
+jurisdiction: state/country lexicon (“California”, “CA”, “New York”, “NY”)
+
+Use Aho-Corasick or a trie to scan once and emit hits with spans. Map synonyms via a small ontology.
+
+4) quantities & IDs (slot filling)
+
+currency: $5,000, USD 5000, 5k → normalize to numeric + unit
+
+limits: “limit 100000” → numeric
+
+dates: “on Jan 3 2024”, “in 2019”, “last year” → normalized ISO if possible
+
+percentages: “10% coinsurance”
+
+ranges: “between 2019 and 2021”
+
+This supports questions like “what deductible” / “what limit” / “loss date”.
+
+5) semantics: negation, qualifiers, scope
+
+negation windows: “not”, “without”, “unless”, “except”
+
+conditionals/qualifiers: “after adding rider”, “subject to”, “while”, “if”
+
+comparatives: “difference between P123 and P456”, “before vs after R-FLD”
+
+scope: tie “flood” to “coverage” vs “claims” as needed
+
+These flags help the planner decide: expand exclusions when “unless excluded” appears; consider both policies when “compare” is true.
+
+6) entity linking & validation
+
+validate anchors against the KG/vector stores:
+
+does P123 exist? which jurisdiction?
+
+is R-FLD actually a rider on P123? (optional, if you keep a rider catalog)
+
+fuzzy reconcile for near-miss IDs if needed (Levenshtein within threshold, but be careful with false positives)
+
+Linking early improves precision and lets you attach defaults (e.g., jurisdiction) to filter vector search.
+
+7) LLM assist (optional, but powerful)
+
+Use an LLM to parse only when:
+
+the question is very long / nested
+
+multiple clauses/conditions are embedded
+
+multilingual
+
+Guard it with a JSON schema prompt and constrained decoding (or post-validate fields). Example prompt:
+
+System: Extract structured parse for insurance Q&A. Output ONLY valid JSON matching this schema: { ... }.
+User: "<question here>"
+
+
+If the JSON fails validation, revert to the rules parse.
+
+ranking features that depend on NLQ
+
+NLQ outputs enable smart ranking downstream:
+
+boost chunks that match risk_terms (“flood” in text)
+
+prefer chunks with clause labels when sections present
+
+filter or boost by jurisdiction if parsed
+
+if deductible_amount_requested, upweight chunks containing money patterns
+
+examples (before → after)
+1) coverage & rider
+
+“After adding R-FLD, does P123 cover flood and what’s the deductible?”
+
+anchors: policies=["P123"], riders=["R-FLD"]
+
+intents: coverage=True, rider=True
+
+risk_terms: ["flood"]
+
+constraints: deductible_amount_requested=True
+
+Planner will expand Policy→Riders/Exclusions and vector-search flood clauses; answerer will prioritize a clause with $5000.
+
+2) exclusions with regulation
+
+“Is flood excluded under P123 unless the California regulation §2695.4 requires otherwise?”
+
+anchors: policies=["P123"], regulations=["§2695.4"], jurisdictions=["CA"]
+
+intents: exclusion=True, regulation=True
+
+qualifiers: ["unless"] (negation-like)
+
+risk_terms: ["flood"]
+
+Planner queries exclusions + regulations; vector search filtered/boosted by CA.
+
+3) comparison
+
+“Compare flood coverage differences between P123 and P456.”
+
+anchors: policies=["P123","P456"]
+
+intents: compare=True, coverage=True
+
+risk_terms: ["flood"]
+
+Planner runs two expansions, composes a diff answer.
+
+implementation sketch (prod-ready-ish, fast path)
+POLICY_RE   = re.compile(r"\bP\d{2,}\b", re.I)
+CLAIM_RE    = re.compile(r"\bCLM-\d+\b", re.I)
+RIDER_RE    = re.compile(r"\bR-[A-Z0-9]+\b", re.I)
+CLAUSE_RE   = re.compile(r"\bclause\s+(\d+(?:\.\d+)*)\b", re.I)
+SECTION_RE  = re.compile(r"\bsection\s+(\d+(?:\.\d+)*)\b", re.I)
+REG_RE      = re.compile(r"(§\s*\d+(?:\.\d+)*)|\b[A-Z]{2,4}RR-[A-Za-z]+\b", re.I)
+MONEY_RE    = re.compile(r"(\$|usd\s*)?(\d{1,3}(?:,\d{3})*|\d+)(?:\s*(?:usd))?", re.I)
+
+INTENT_WORDS = {
+  "coverage": {"cover","coverage","covered","limit","deductible"},
+  "exclusion": {"exclude","exclusion","excluded","exclusions","except","unless"},
+  "rider": {"rider","endorsement","add-on","endorsements"},
+  "claim": {"claim","claims","loss","losses","filed","paid"},
+  "regulation": {"regulation","regulations","law","statute","compliance"},
+  "compare": {"compare","difference","diff","vs","versus","compareto"}
+}
+RISKS = {"flood","earthquake","earth","wind","fire","war","theft","water","sewer"}
+
+def normalize(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text).lower().split())
+
+def parse_fast(text, kg_lookup):
+    t = normalize(text)
+    anchors = {
+        "policies": POLICY_RE.findall(t),
+        "claims":   CLAIM_RE.findall(t),
+        "riders":   RIDER_RE.findall(t),
+        "regulations": [m[0] or m[1] for m in REG_RE.findall(t)],
+        "sections": [{"type":"clause","value":m} for m in CLAUSE_RE.findall(t)]
+                    + [{"type":"section","value":m} for m in SECTION_RE.findall(t)],
+        "jurisdictions": []  # fill via lexicon match if needed
+    }
+    intents = {k: any(w in t.split() for w in vocab) for k,vocab in INTENT_WORDS.items()}
+    risks = [r for r in RISKS if r in t]
+    numbers = []
+    for m in MONEY_RE.finditer(t):
+        raw = m.group(0)
+        val = int(m.group(2).replace(",",""))
+        numbers.append({"value": val, "unit":"USD" if "$" in raw or "usd" in raw else None, "raw": raw})
+    constraints = {
+        "deductible_amount_requested": "deductible" in t,
+        "limits_requested": "limit" in t,
+        "differences_requested": intents["compare"]
+    }
+    # validate anchors against KG (cheap existence checks)
+    anchors["policies"] = [p for p in anchors["policies"] if kg_lookup.has_policy(p.upper())]
+    anchors["claims"]   = [c for c in anchors["claims"] if kg_lookup.has_claim(c.upper())]
+    return {
+        "text": text,
+        "anchors": anchors,
+        "intents": intents,
+        "risk_terms": risks,
+        "numbers": {"currency": numbers},
+        "constraints": constraints,
+        "negations": ["unless"] if "unless" in t else [],
+        "qualifiers": ["after adding rider"] if "after adding" in t and "rider" in t else [],
+        "confidence": 0.9
+    }
+
+
+(In practice, pre-compile regexes and use a trie/Aho-Corasick for INTENT_WORDS & RISKS.)
+
+quality, metrics, tests
+
+what to measure
+
+Anchor precision/recall: % of correct P###, CLM-###, rider codes captured
+
+Intent accuracy: multi-label F1
+
+Latency: p95 < 2–5 ms for fast path
+
+Fallback rate: % of questions needing LLM assist
+
+unit tests (examples)
+
+“Does P123 cover flood?” → policies=["P123"], risk_terms=["flood"], coverage=True
+
+“Compare P123 vs P456 for earthquake” → two policies, compare=True, risk_terms=["earthquake"]
+
+“Is flood excluded unless R-FLD is attached?” → exclusion=True, rider=True, qualifier “unless”
+
+Money extraction: $5,000 and USD 100000 recognized, normalized
+
+performance & robustness tricks
+
+Pre-compile regex; reuse across requests
+
+Use Aho-Corasick for large synonym dictionaries (O(n) per query)
+
+Bloom filter for quick “maybe exists” checks before DB hits
+
+Cache KG presence for hot IDs (policy numbers)
+
+Ambiguity handling:
+
+If multiple policies found and no “compare”, pick the first and flag ambiguous=true for UI
+
+If a token matches both rider code and product code, prefer rider if intent rider=True
+
+multilingual / i18n (if needed)
+
+Keep the schema the same; swap dictionaries per locale
+
+Use locale-aware money/date parsing
+
+Optionally use a small LLM prompt to normalize non-English questions into English before rule parsing
+
+when to call the LLM parser
+
+very long, nested questions (“if X then… unless Y… and compare with …”)
+
+lots of implicit references (“that claim”, “the above policy” across turns)
+
+unstructured lists (“list all coverages not excluded that apply to floods and wind…”)
+
+Always validate the LLM’s JSON against your schema and fallback to the fast path if validation fails.
