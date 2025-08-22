@@ -1,0 +1,605 @@
+End-to-End Design: LLM-Powered Insurance Knowledge Graph (KG) for Dynamic, Holistic Answers
+
+Below is a complete, production-minded design with architecture diagrams (ASCII), data flow, ontology & schema, API contracts, implementation blueprints (code snippets, Cypher/SQL), sample test data, caching/ranking, scalability & DR, performance estimates, and UX patterns. It’s optimized to assemble all relevant documents (policy, riders, claims, risk, regulations) per question, and to return reference-rich, complete answers.
+
+1) Goals & Non-Goals
+
+Goals
+
+Build an insurance domain KG that unifies policies, risks, claims, parties, coverages, exclusions, riders, and regulations.
+
+Enable dynamic, multi-hop retrieval from KG + semantic stores; return grounded, cited answers.
+
+Support multi-source ingestion (DBs, PDFs, OCR, spreadsheets, APIs).
+
+Provide auditability (trace every sentence to sources & clauses).
+
+Non-Goals
+
+Full actuarial modeling; here we link to model outputs but don’t re-implement them.
+
+Claims adjudication automation; focus is knowledge & Q&A.
+
+2) High-Level Architecture (ASCII)
+                                      ┌─────────────────────────────────────┐
+                                      │ External Sources                    │
+                                      │  • Policy DB / CSVs                 │
+                                      │  • Claims DB / APIs                 │
+                                      │  • Risk models (scores)             │
+                                      │  • Regulations (PDF/HTML)           │
+                                      │  • Scanned docs (OCR)               │
+                                      └───────────────┬─────────────────────┘
+                                                      │  (ETL + NLP + OCR)
+                                                      ▼
+┌────────────────────────────────────────────────────────────────────────────────┐
+│ Ingestion & Enrichment Layer                                                   │
+│  • Connectors (DB/APIs/Files)  • OCR (if needed)   • NER/EL (Policy, Risk...) │
+│  • Chunker  • Clause Extractor  • Normalizers      • Embedding Generator       │
+│  • Provenance + Lineage         • Validation Rules • Event Bus (Kafka)         │
+└───────────────┬──────────────────────────────────────────────┬─────────────────┘
+                │                                              │
+                │  Graph upserts (nodes/edges)                 │  Vector upserts
+                ▼                                              ▼
+      ┌──────────────────────┐                          ┌───────────────────────┐
+      │ Knowledge Graph DB   │                          │ Vector/Text Index     │
+      │ (Neo4j / Neptune)    │                          │ (Postgres+pgvector or │
+      │  • Nodes/Edges       │                          │  OpenSearch)          │
+      │  • Ontology/Schema   │                          │  • Chunks + Embeds    │
+      │  • Constraints/Idx   │                          │  • BM25 + Hybrid      │
+      └──────────┬───────────┘                          └──────────┬────────────┘
+                 │                                                │
+                 └────────────┬───────────────────────────────────┘
+                              │ Hybrid Retrieval (Graph + Vector)
+                              ▼
+                    ┌───────────────────────────┐
+                    │ Orchestrator (LLM Router) │
+                    │  • NLQ parsing             │
+                    │  • Entity/Relation detect  │
+                    │  • Query Planner (Cypher + │
+                    │    vector queries)         │
+                    │  • Context Assembler       │
+                    │  • Citation Builder        │
+                    └───────────┬────────────────┘
+                                │ curated context
+                                ▼
+                       ┌───────────────────────┐
+                       │ Answer LLM / Rewriter│
+                       │  • Safety/Guardrails │
+                       │  • Structured output │
+                       │  • Confidence score  │
+                       └───────────┬──────────┘
+                                   │
+                                   ▼
+                        ┌────────────────────────┐
+                        │ API Gateway (REST/gRPC)│
+                        │  /ask  /ingest  /graph │
+                        └───────────┬────────────┘
+                                    │
+                                    ▼
+                           ┌───────────────────┐
+                           │ UI / BI / Agents  │
+                           │  • Chat UI        │
+                           │  • Claim Desk App │
+                           │  • Audit Console  │
+                           └───────────────────┘
+
+3) Ontology (Core Data Model)
+
+Node Types
+
+Policy {policy_number, effective_date, expiry_date, product, jurisdiction, …}
+
+Coverage {type, limit, deductible, …}
+
+Exclusion {name, text, clause_ref, …}
+
+Rider {name, text, clause_ref, …}
+
+Claim {claim_id, date_of_loss, cause, amount, status, …}
+
+Risk {type, score, model_version, factors, …}
+
+Party {party_id, role (Insured/Beneficiary/Insurer/Broker), name, …}
+
+Regulation {jurisdiction, citation, section, text, …}
+
+DocumentChunk {doc_id, chunk_id, text, page, clause, embedding_ref, …}
+
+Edge Types
+
+(:Policy)-[:HAS_COVERAGE]->(:Coverage)
+
+(:Policy)-[:HAS_EXCLUSION]->(:Exclusion)
+
+(:Policy)-[:HAS_RIDER]->(:Rider)
+
+(:Policy)-[:ISSUED_TO]->(:Party {role:"Insured"})
+
+(:Claim)-[:AGAINST_POLICY]->(:Policy)
+
+(:Claim)-[:RELATED_TO_RISK]->(:Risk)
+
+(:Coverage)-[:CONSTRAINED_BY]->(:Exclusion)
+
+(:Policy|:Coverage|:Exclusion|:Rider)-[:CITES]->(:Regulation)
+
+(:DocumentChunk)-[:EVIDENCES]->(Any node)
+
+(:Risk)-[:ASSESSMENT_OF]->(:Party|:Asset) (optional extension)
+
+Ontology Sketch (ASCII)
+
+(Party)<-ISSUED_TO-(Policy)-HAS_COVERAGE->(Coverage)-CONSTRAINED_BY->(Exclusion)
+   ^                         |                   ^
+   |                         |                   |
+   |                      HAS_RIDER              |
+   |                         |                   |
+   |                         v                   |
+   |                      (Rider)                |
+   |                                             |
+(Claim)-AGAINST_POLICY->(Policy)                 |
+   |                                             |
+   └-RELATED_TO_RISK->(Risk)                     |
+                                                 |
+(Policy|Coverage|Exclusion|Rider)-CITES->(Regulation)
+
+(DocumentChunk)-EVIDENCES->(Policy|Coverage|Exclusion|Rider|Claim|Risk|Regulation)
+
+4) Storage & Indexing
+
+Graph: Neo4j (or AWS Neptune) with schema indexes on policy_number, claim_id, jurisdiction, clause_ref.
+
+Vector / Text: Postgres + pgvector (or OpenSearch) holding chunked text with embeddings; BM25 for keyword, hybrid rerank.
+
+Blob Storage: PDFs, OCR outputs, audit dumps in S3/GCS with signed URLs.
+
+Neo4j Constraints (examples)
+
+CREATE CONSTRAINT policy_num_unique IF NOT EXISTS
+FOR (p:Policy) REQUIRE p.policy_number IS UNIQUE;
+
+CREATE INDEX claim_id_idx IF NOT EXISTS FOR (c:Claim) ON (c.claim_id);
+CREATE INDEX reg_citation_idx IF NOT EXISTS FOR (r:Regulation) ON (r.citation);
+CREATE INDEX doc_chunk_id_idx IF NOT EXISTS FOR (d:DocumentChunk) ON (d.doc_id, d.chunk_id);
+
+
+Postgres Tables (vector side)
+
+CREATE TABLE chunks (
+  doc_id TEXT,
+  chunk_id TEXT,
+  node_type TEXT,        -- Policy / Claim / Regulation / ...
+  node_key TEXT,         -- policy_number, claim_id, etc.
+  source_uri TEXT,
+  page INT,
+  clause TEXT,
+  text TEXT,
+  embedding VECTOR(1536), -- match your model dims
+  PRIMARY KEY (doc_id, chunk_id)
+);
+
+CREATE INDEX ON chunks USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX ON chunks (node_type, node_key);
+CREATE INDEX ON chunks USING gin (to_tsvector('english', text));
+
+5) Data Flow (Ingestion → Answer)
+
+End-to-End Flow (ASCII)
+
+[Sources] -> [Connectors] -> [OCR/Parsing] -> [NER/Entity Linking] -> [Chunker + Embeds]
+         -> [Graph Upsert (nodes/edges + clause refs)] -> [Vector Upsert (chunks+embeds)]
+                                                            |
+User Q -> Orchestrator: NLQ parse -> Entity/Relation detect -> Query Planner:
+  1) Cypher multi-hop from anchor nodes (policies/claims/risks)
+  2) Vector search for unlinked but semantically relevant chunks
+  3) Merge + Rerank (BM25 + cosine + cross-encoder optional)
+  4) Context pack (quotes + citations) -> LLM -> Answer + Citations
+
+6) Retrieval Strategy (Hybrid & Dynamic)
+
+Entity Anchoring: Identify concrete anchors (e.g., policy_number, claim_id).
+
+Graph Multi-Hop: Expand from anchors 1–2 hops along ontology edges with type-aware limits:
+
+e.g., Policy -> HAS_EXCLUSION -> Exclusion
+
+e.g., Policy -> HAS_COVERAGE -> Coverage -> CONSTRAINED_BY -> Exclusion
+
+e.g., Claim -> AGAINST_POLICY -> Policy -> ...
+
+Vector Recall: Pull top-k chunks for:
+
+anchor nodes’ doc evidence
+
+semantically similar regulatory clauses (jurisdiction filter)
+
+Rerank: Weighted score = α * cosine + β * BM25 + γ * path_centrality + δ * recency.
+
+Context Assembly: Deduplicate, enforce jurisdiction/product constraints, include clause IDs, page refs.
+
+Citations & Attributions: Every fact line ties to DocumentChunk or clause ref.
+
+Sample Cypher Templates
+
+From policy → exclusions + supporting chunks:
+
+MATCH (p:Policy {policy_number: $policy_number})
+OPTIONAL MATCH (p)-[:HAS_EXCLUSION]->(e:Exclusion)
+OPTIONAL MATCH (p)-[:HAS_COVERAGE]->(cov:Coverage)-[:CONSTRAINED_BY]->(e2:Exclusion)
+WITH p, COLLECT(DISTINCT e)+COLLECT(DISTINCT e2) AS exs
+UNWIND exs AS ex
+OPTIONAL MATCH (d:DocumentChunk)-[:EVIDENCES]->(ex)
+RETURN p, ex, COLLECT(DISTINCT d)[0..5] AS evidence
+
+
+Claims related to a policy and their risks:
+
+MATCH (p:Policy {policy_number: $policy_number})<-[:AGAINST_POLICY]-(c:Claim)
+OPTIONAL MATCH (c)-[:RELATED_TO_RISK]->(r:Risk)
+RETURN p, COLLECT(DISTINCT c) AS claims, COLLECT(DISTINCT r) AS risks
+
+7) Orchestrator Implementation (Blueprint)
+
+Key components
+
+NLQParser: Heuristics + small NER/RE model to extract anchors (policy_number, claim_id, coverage types, jurisdictions).
+
+QueryPlanner: Builds Cypher queries and vector filters; decides hop counts and caps (to prevent explosion).
+
+Retriever: Executes graph + vector calls; merges & reranks; ensures coverage of all relevant facets (policy, riders, exclusions, claims, regs).
+
+ContextAssembler: Packs chunks with source spans, adds short summaries at top, preserves citation IDs.
+
+Answerer: LLM call with guardrails: do not hallucinate, answer only from provided context; if insufficient, ask to ingest or return “insufficient evidence” note.
+
+Pseudo-Python (abridged)
+
+def ask(question: str):
+    anchors = NLQParser.extract_anchors(question)  # policy_number, claim_id, coverage keywords, jurisdiction
+    cypher_list = QueryPlanner.plan(anchors, question)
+    graph_results = GraphClient.run_many(cypher_list)
+
+    vector_filters = VectorPlanner.filters_from(anchors, question)
+    sem_chunks = VectorClient.hybrid_search(question, filters=vector_filters, top_k=40)
+
+    merged = Reranker.merge_and_score(graph_results, sem_chunks)
+    context = ContextAssembler.pack(merged, budget_tokens=6000)
+
+    prompt = build_prompt(question, context)
+    answer = LLM.generate(prompt, temperature=0)
+    return postprocess_with_citations(answer, context)
+
+
+Prompt Skeleton
+
+System: You are an insurance domain expert. Use only the provided context.
+User Question: {q}
+
+Context (verbatim excerpts with IDs):
+[Doc:POL-P123:Clause 4.2:page 12] "Flood losses are excluded unless rider R-FLD applies."
+[Doc:RID-R-FLD:page 2] "Adds flood coverage with deductible $5k..."
+[Doc:CLAIM-987:AdjNote p3] "2019 flood in basement..."
+
+Instructions:
+1) Provide a complete, precise answer.
+2) For each factual claim, include bracketed citations: [ID].
+3) If evidence is missing, state "Insufficient evidence" for that part.
+
+8) Public API (REST) Contracts
+POST /ingest/batch
+{
+  "policies": [...],
+  "claims": [...],
+  "regulations": [...],
+  "documents": [{"doc_id":"POL-P123.pdf","uri":"s3://..."}]
+}
+
+
+Response
+
+{"status":"accepted","batch_id":"ing-2025-08-14-0001"}
+
+POST /ask
+{
+  "question": "What risks are excluded in policy P123 and do any riders restore them?",
+  "hints": {"policy_number":"P123","jurisdiction":"CA"}
+}
+
+
+Response
+
+{
+  "answer": "Flood and earth movement are excluded, but rider R-FLD restores flood...",
+  "citations": [
+    {"id":"POL-P123:Clause4.2","page":12,"uri":"..."},
+    {"id":"RID-R-FLD:p2","page":2,"uri":"..."}
+  ],
+  "confidence": 0.83
+}
+
+POST /graph/search
+{"cypher": "MATCH (p:Policy{policy_number:'P123'})-[:HAS_EXCLUSION]->(e) RETURN e LIMIT 25"}
+
+
+Response
+
+{"records":[{"e":{"name":"Flood"}}]}
+
+9) Sample Test Data (Minimal but Realistic)
+
+Policies (CSV)
+
+policy_number,effective_date,expiry_date,product,jurisdiction
+P123,2024-01-01,2024-12-31,Homeowners,CA
+P456,2024-06-01,2025-05-31,CommercialProperty,NY
+
+
+Coverages (CSV)
+
+policy_number,coverage_type,limit,deductible
+P123,Property,500000,1000
+P123,Liability,300000,0
+
+
+Exclusions (CSV)
+
+policy_number,exclusion_name,clause_ref,text
+P123,Flood,Clause 4.2,"Flood losses are excluded unless a flood rider is attached."
+P123,Earth Movement,Clause 4.3,"Earthquake and earth movement are excluded."
+
+
+Riders (CSV)
+
+policy_number,rider_name,clause_ref,text
+P123,R-FLD,Clause 7.1,"Adds flood coverage limit 100000 with $5000 deductible."
+
+
+Claims (CSV)
+
+claim_id,policy_number,date_of_loss,cause,amount,status
+CLM-987,P123,2019-11-12,Flood,18000,Closed
+CLM-654,P123,2023-02-10,Wind,3500,Closed
+
+
+Risks (CSV)
+
+risk_id,type,score,model_version,policy_number
+RISK-1,Flood,0.72,rmv2,P123
+RISK-2,Earthquake,0.41,rmv2,P123
+
+
+Regulations (CSV)
+
+jurisdiction,citation,section,text
+CA,CCR-Title10,§2695.4,"Fair claims settlement practices... flood definition..."
+
+
+Document Chunks (TSV) (if you want to seed directly)
+
+doc_id  chunk_id  node_type  node_key  page  clause       text
+POL-P123  c1      Policy     P123      12    Clause 4.2   Flood losses are excluded unless...
+RID-R-FLD c2      Rider      R-FLD     2     Clause 7.1   Adds flood coverage limit...
+CLAIM-987 c3      Claim      CLM-987   3     -            2019 basement flood...
+REG-CA    c4      Regulation CCR-Title10 18  §2695.4      Fair claims settlement...
+
+10) Ingestion & Build Scripts (Illustrative)
+
+Python: Build Embeddings & Upsert Vector Store
+
+# pip install sentence-transformers psycopg2-binary pandas
+import pandas as pd
+import psycopg2
+from sentence_transformers import SentenceTransformer
+
+m = SentenceTransformer("all-MiniLM-L6-v2")
+conn = psycopg2.connect("dbname=kg user=kg_user password=*** host=...")
+
+chunks = pd.read_csv("document_chunks.tsv", sep="\t")
+chunks["embedding"] = chunks["text"].apply(lambda t: m.encode(t).tolist())
+
+with conn, conn.cursor() as cur:
+    for _, row in chunks.iterrows():
+        cur.execute("""
+          INSERT INTO chunks (doc_id, chunk_id, node_type, node_key, source_uri, page, clause, text, embedding)
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+          ON CONFLICT (doc_id, chunk_id) DO UPDATE SET text=EXCLUDED.text, embedding=EXCLUDED.embedding
+        """, (
+          row.doc_id, row.chunk_id, row.node_type, row.node_key, f"s3://bucket/{row.doc_id}",
+          int(row.page), row.clause, row.text, row.embedding
+        ))
+
+
+Neo4j Upserts (Cypher via Python)
+(Use official driver; here just Cypher examples)
+
+// Policy
+MERGE (p:Policy {policy_number: $policy_number})
+  ON CREATE SET p.effective_date=$effective_date, p.expiry_date=$expiry_date, p.product=$product, p.jurisdiction=$jurisdiction;
+
+// Coverage
+MATCH (p:Policy {policy_number:$policy_number})
+MERGE (c:Coverage {policy_number:$policy_number, type:$coverage_type})
+SET c.limit=$limit, c.deductible=$deductible
+MERGE (p)-[:HAS_COVERAGE]->(c);
+
+// Exclusion
+MATCH (p:Policy {policy_number:$policy_number})
+MERGE (e:Exclusion {policy_number:$policy_number, name:$exclusion_name})
+SET e.clause_ref=$clause_ref, e.text=$text
+MERGE (p)-[:HAS_EXCLUSION]->(e);
+
+// Rider
+MATCH (p:Policy {policy_number:$policy_number})
+MERGE (r:Rider {policy_number:$policy_number, name:$rider_name})
+SET r.clause_ref=$clause_ref, r.text=$text
+MERGE (p)-[:HAS_RIDER]->(r);
+
+// Claim
+MERGE (c:Claim {claim_id:$claim_id})
+SET c.date_of_loss=$date_of_loss, c.cause=$cause, c.amount=$amount, c.status=$status
+WITH c
+MATCH (p:Policy {policy_number:$policy_number})
+MERGE (c)-[:AGAINST_POLICY]->(p);
+
+// Risk
+MERGE (r:Risk {risk_id:$risk_id})
+SET r.type=$type, r.score=$score, r.model_version=$model_version
+WITH r
+MATCH (p:Policy {policy_number:$policy_number})
+MERGE (r)-[:ASSESSMENT_OF]->(p);
+
+// Regulation
+MERGE (rg:Regulation {citation:$citation, section:$section})
+SET rg.jurisdiction=$jurisdiction, rg.text=$text;
+
+// Evidence link
+MATCH (eTarget {policy_number:$policy_number})  // e.g., Policy or Exclusion; adapt matcher
+MERGE (d:DocumentChunk {doc_id:$doc_id, chunk_id:$chunk_id})
+SET d.page=$page, d.clause=$clause, d.text=$text
+MERGE (d)-[:EVIDENCES]->(eTarget);
+
+11) Test Scenarios & Expected Behavior
+
+Q1: “List all exclusions for policy P123 and indicate if any riders restore coverage.”
+Expected: Returns Flood [POL-P123:Clause4.2] and Earth Movement [4.3]. Notes R-FLD restores flood with limits/deductible. Citations to policy clause & rider clause.
+
+Q2: “Does policy P123 cover flood after rider R-FLD?”
+Expected: “Yes, flood is covered up to $100,000 with $5,000 deductible when rider R-FLD is attached.” Citations: rider clause, policy exclusion clause stating exception.
+
+Q3: “What past claims on P123 relate to excluded risks?”
+Expected: “Claim CLM-987 (2019, Flood) relates to previously excluded risk Flood; however, if rider R-FLD effective at loss date, coverage may apply.” Citations: claim note + policy clause + rider clause.
+
+Q4: “Any California regulations affecting flood claim handling?”
+Expected: Cite CCR-Title10 §2695.4 excerpt.
+
+12) Ranking, Caching, and Consistency
+
+Ranking
+
+Hybrid: cosine (embedding) + BM25 + path centrality (shorter hops count more) + jurisdiction/product match + recency.
+
+Optional cross-encoder reranker for top-N to improve precision of passages.
+
+Caching
+
+Query Result Cache: key = normalized NLQ + anchor IDs + user role; TTL 5–30 min.
+
+Graph Subpath Cache: store frequent subgraphs (e.g., policy→exclusions) keyed by policy_number.
+
+Embedding Cache for identical chunks (hash of text).
+
+Consistency
+
+Strong within a single answer (frozen snapshot of context).
+
+Eventual between ingestion and availability (seconds-to-minutes depending on pipeline).
+
+Use versioned nodes for policies to preserve historical clauses (temporal queries possible).
+
+13) Security, Privacy, Compliance
+
+PII/PHI: Field-level encryption (KMS), tokenization where possible; audit logs for reads.
+
+Row/Node-level ACLs: Attribute-based access control (ABAC) – e.g., adjust retrieval by user’s department.
+
+Jurisdiction Filters: Enforce regulatory visibility by region.
+
+Data Lineage: Every answer links to DocumentChunk → underlying source_uri.
+
+14) Observability & Guardrails
+
+Tracing (OpenTelemetry): spans for NLQ parse, graph query, vector search, rerank, LLM call.
+
+Metrics: recall@k, answer latency, context token count, % answers with ≥2 citations, deflection rate.
+
+Guardrails: refuse to answer if citations < threshold; red-flag if policy dates outside effective period.
+
+15) Scalability & DR
+
+Scale Targets (example)
+
+10M policies, 50M claims, 200M chunks, 500M edges.
+
+P95 answer latency target: < 2.5s with warmed caches.
+
+Scale Tactics
+
+Graph: HA cluster; read replicas for queries; relationship indexes; capped expansions.
+
+Vector: pgvector with IVFFlat; partition by jurisdiction/product; async reindex.
+
+Parallel retrieval & streaming context assembly.
+
+DR
+
+Nightly graph full export + hourly WAL backups.
+
+Vector store snapshots to S3; cross-region replication.
+
+IaC (Terraform) to rebuild infra; runbooks for failover.
+
+16) Back-of-the-Envelope
+
+Embeddings storage: 200M chunks × 1536 dims × 4 bytes ≈ 1.23 TB + metadata (~0.4–0.8 TB) → plan 2–3 TB.
+
+Throughput: With caching + parallel retrieval, 20–50 QPS per orchestrator shard; scale horizontally.
+
+Cost drivers: embedding compute (ingestion), vector IO, LLM tokens; reduce by aggressive context pruning & caching.
+
+17) User Experience (Answer Format)
+
+Top Summary (2–4 bullets) with bold key outcomes.
+
+Details by facet: Coverage, Exclusions, Riders, Claims, Regulations.
+
+Inline citations like [POL-P123:Clause4.2 p12].
+
+Confidence badge + “Missing evidence” callouts.
+
+“Open sources” buttons per citation (signed URLs).
+
+18) Example: End-to-End Answer Walkthrough
+
+User: “After adding R-FLD, does P123 cover flood and what deductible applies?”
+System:
+
+Anchor P123, detect term “flood”, rider “R-FLD”.
+
+Graph hops: Policy -> HAS_EXCLUSION(Flood), Policy -> HAS_RIDER(R-FLD).
+
+Vector: find rider clause text + policy clause 4.2 + CA regulation snippet.
+
+Rerank & assemble; LLM produces:
+
+Yes. With rider R-FLD, flood is covered up to $100,000 with a $5,000 deductible.
+Evidence: [POL-P123:Clause4.2 p12], [RID-R-FLD:Clause7.1 p2].
+
+19) Minimal Local Testing Harness (Optional)
+
+Unit-level retrieval test (pseudo-pytest)
+
+def test_exclusion_restored_by_rider():
+    ctx = ask("After adding R-FLD, does P123 cover flood?")
+    assert "flood is covered" in ctx["answer"].lower()
+    assert any("RID-R-FLD" in c["id"] for c in ctx["citations"])
+    assert any("POL-P123:Clause4.2" in c["id"] for c in ctx["citations"])
+
+20) Design Trade-offs (Selected)
+Area	Choice	Why	Trade-off
+Graph DB	Neo4j	Mature tooling, Cypher expressiveness	License/cost vs Neptune managed
+Vector Store	pgvector	Simpler ops, SQL joins/filters	For high scale, consider OpenSearch/FAISS
+Query Planning	LLM-assisted	Flexible, handles messy NL	Add validator & allowlists to prevent bad Cypher
+Evidence Granularity	Clause/Chunk	Precise citations	More ingestion work (chunking + clause extraction)
+Consistency	Eventual	Fast ingestion, scalable	Recent updates might lag seconds-minutes
+Reranking	Hybrid + cross-encoder	Higher precision	Extra compute; cache aggressively
+21) What to Build First (Milestones)
+
+MVP Ontology (Policy, Coverage, Exclusion, Rider, Claim, Regulation, DocumentChunk).
+
+Batch Ingestion for CSVs + PDF chunks (no OCR initially).
+
+Hybrid Retrieval (Cypher templates + pgvector).
+
+LLM Orchestrator with strict prompt & citation checks.
+
+Audit UI to inspect answer → sources graph.
